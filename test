@@ -1,0 +1,8 @@
+mkdir -p /data/sda4/PS2/t2r && echo hi > /data/sda4/PS2/t2r/a
+2ram /data/sda4/PS2/t2r
+echo synced > /data/sda4/PS2/t2r/b
+2ram sync /data/sda4/PS2/t2r
+ls /run/2ram/.orig/data_sda4_PS2_t2r
+echo lost > /data/sda4/PS2/t2r/c
+2ram restore /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r /run/2ram/.orig/data_sda4_PS2_t2r; ls /data/sda4/PS2/t2r; rm -rf /data/sda4/PS2/t2r
