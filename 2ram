@@ -1,0 +1,126 @@
+
+#!/bin/bash
+set -u
+RDROOT=${RDROOT:-/run/2ram}
+STATE=/var/lib/2ram
+DEFSIZE=4M
+
+die(){ echo "2ram: $*" >&2; exit 1; }
+usage(){
+  echo "usage: 2ram DIR [SIZE]   load DIR into ramdisk (default $DEFSIZE), bind over DIR"
+  echo "       2ram unload DIR|all   copy ram data back into DIR, then drop mounts"
+  echo "       2ram restore DIR|all  drop mounts, DIR returns to its pre-2ram state (ram changes discarded)"
+  echo "       2ram list"
+  exit 1
+}
+
+[ "$(id -u)" -eq 0 ] || die "run as root"
+RDMOUNT=${RDMOUNT:-$(command -v rdmount 2>/dev/null)}
+
+tobytes(){
+  local s=${1^^} n u
+  s=${s%B}
+  n=${s%[KMG]}
+  u=${s#"$n"}
+  [[ $n =~ ^[0-9]+$ ]] || return 1
+  case $u in
+    "") echo "$n";;
+    K)  echo $((n*1024));;
+    M)  echo $((n*1048576));;
+    G)  echo $((n*1073741824));;
+    *)  return 1;;
+  esac
+}
+
+mkid(){ echo "$1" | tr '/' '_' | sed 's/^_//'; }
+
+is_bound(){
+  mountpoint -q "$MP" && mountpoint -q "$DIR" || return 1
+  [ "$(stat -c %d "$DIR")" = "$(stat -c %d "$MP")" ]
+}
+
+do_load(){
+  local dir size need used id
+  [ -n "${1:-}" ] || usage
+  dir=$(realpath -e -- "$1") || die "no such path: $1"
+  size=${2:-$DEFSIZE}
+  [ -d "$dir" ] || die "not a directory: $dir"
+  [ "$dir" != "/" ] || die "refusing /"
+  id=$(mkid "$dir")
+  [ ! -e "$STATE/$id" ] || die "already loaded: $dir"
+  need=$(tobytes "$size") || die "bad size: $size"
+  used=$(du -sb -- "$dir" | cut -f1)
+  [ "$used" -le "$need" ] || die "data is ${used}B, exceeds $size"
+  mkdir -p "$STATE" "$RDROOT/$id" || die "mkdir failed"
+  DIR=$dir; MP=$RDROOT/$id; SIZE=$size
+  [ -n "$RDMOUNT" ] && [ -x "$RDMOUNT" ] || { rmdir "$MP" 2>/dev/null; die "rdmount not found (set RDMOUNT=/full/path)"; }
+  "$RDMOUNT" "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+  mountpoint -q "$MP" || { rmdir "$MP" 2>/dev/null; die "$MP not mounted by rdmount"; }
+  cp -a -- "$DIR"/. "$MP"/ || { umount "$MP"; rmdir "$MP"; die "copy to ram failed, nothing changed"; }
+  diff -rq -- "$DIR" "$MP" >/dev/null 2>&1 || { umount "$MP"; rmdir "$MP"; die "verify failed, nothing changed"; }
+  mount --bind "$MP" "$DIR" || { umount "$MP"; rmdir "$MP"; die "bind failed, nothing changed"; }
+  printf 'DIR=%q\nMP=%q\nSIZE=%q\n' "$DIR" "$MP" "$SIZE" > "$STATE/$id"
+  echo "2ram: $DIR -> $MP ($SIZE), bound"
+}
+
+do_unload(){
+  command -v rsync >/dev/null 2>&1 || die "rsync required for unload"
+  is_bound || die "$DIR not currently bound to $MP (use: 2ram restore $DIR)"
+  sync
+  umount "$DIR" || die "$DIR busy, still bound, nothing changed"
+  if ! rsync -a --delete -- "$MP"/ "$DIR"/; then
+    mount --bind "$MP" "$DIR"
+    die "copy back failed, re-bound ram copy, no data lost"
+  fi
+  if [ -n "$(rsync -anc --delete --itemize-changes -- "$MP"/ "$DIR"/)" ]; then
+    mount --bind "$MP" "$DIR"
+    die "verify failed, re-bound ram copy, no data lost"
+  fi
+  umount "$MP" || die "data saved to $DIR, but could not unmount $MP"
+  rmdir "$MP" 2>/dev/null
+  rm -f "$STATE/$(mkid "$DIR")"
+  echo "2ram: $DIR unloaded, ram data written back"
+}
+
+do_restore(){
+  if is_bound; then
+    umount "$DIR" || die "$DIR busy, nothing changed"
+  fi
+  if mountpoint -q "$MP"; then
+    umount "$MP" || die "could not unmount $MP"
+  fi
+  rmdir "$MP" 2>/dev/null
+  rm -f "$STATE/$(mkid "$DIR")"
+  echo "2ram: $DIR restored to original mounts"
+}
+
+do_list(){
+  local f
+  for f in "$STATE"/*; do
+    [ -e "$f" ] || continue
+    . "$f"
+    if is_bound; then echo "$DIR  $MP  $SIZE  bound"; else echo "$DIR  $MP  $SIZE  NOT-BOUND"; fi
+  done
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage;;
+  list) do_list;;
+  unload|restore)
+    cmd=$1; shift
+    [ -n "${1:-}" ] || usage
+    if [ "$1" = "all" ]; then
+      for f in "$STATE"/*; do
+        [ -e "$f" ] || continue
+        . "$f"
+        "do_$cmd"
+      done
+    else
+      d=$(realpath -m -- "$1")
+      f="$STATE/$(mkid "$d")"
+      [ -e "$f" ] || die "not managed by 2ram: $d"
+      . "$f"
+      "do_$cmd"
+    fi;;
+  *) do_load "$@";;
+esac
