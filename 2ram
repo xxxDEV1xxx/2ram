@@ -10,11 +10,18 @@ usage(){
   echo "usage: 2ram DIR [SIZE]   load DIR into ramdisk (default $DEFSIZE), bind over DIR"
   echo "       2ram unload DIR|all   copy ram data back into DIR, then drop mounts"
   echo "       2ram restore DIR|all  drop mounts, DIR returns to its pre-2ram state (ram changes discarded)"
+  echo "       2ram sync DIR|all     copy ram data to disk, keep mounts"
   echo "       2ram list"
   exit 1
 }
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
+if command -v flock >/dev/null 2>&1; then
+  mkdir -p "$STATE"
+  exec 9>"$STATE/.lock"
+  flock -n 9 || die "another 2ram is running"
+fi
+rs(){ rsync -aHAX "$@" 2>/dev/null || rsync -aH "$@"; }
 RDMOUNT=${RDMOUNT:-$(command -v rdmount 2>/dev/null)}
 
 tobytes(){
@@ -51,15 +58,18 @@ do_load(){
   need=$(tobytes "$size") || die "bad size: $size"
   used=$(du -sb -- "$dir" | cut -f1)
   [ "$used" -le "$need" ] || die "data is ${used}B, exceeds $size"
-  mkdir -p "$STATE" "$RDROOT/$id" || die "mkdir failed"
-  DIR=$dir; MP=$RDROOT/$id; SIZE=$size
+  [ "${FORCE:-0}" = 1 ] || [ $((used*100)) -le $((need*80)) ] || die "data is ${used}B, over 80% of $size, use a bigger size (FORCE=1 to override)"
+  command -v rsync >/dev/null 2>&1 || die "rsync required"
+  mkdir -p "$STATE" "$RDROOT/$id" "$RDROOT/.orig/$id" || die "mkdir failed"
+  DIR=$dir; MP=$RDROOT/$id; SIZE=$size; SH=$RDROOT/.orig/$id
   [ -n "$RDMOUNT" ] && [ -x "$RDMOUNT" ] || { rmdir "$MP" 2>/dev/null; die "rdmount not found (set RDMOUNT=/full/path)"; }
   "$RDMOUNT" "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
   mountpoint -q "$MP" || { rmdir "$MP" 2>/dev/null; die "$MP not mounted by rdmount"; }
-  cp -a -- "$DIR"/. "$MP"/ || { umount "$MP"; rmdir "$MP"; die "copy to ram failed, nothing changed"; }
+  rs -- "$DIR"/ "$MP"/ || { umount "$MP"; rmdir "$MP"; die "copy to ram failed, nothing changed"; }
   diff -rq -- "$DIR" "$MP" >/dev/null 2>&1 || { umount "$MP"; rmdir "$MP"; die "verify failed, nothing changed"; }
-  mount --bind "$MP" "$DIR" || { umount "$MP"; rmdir "$MP"; die "bind failed, nothing changed"; }
-  printf 'DIR=%q\nMP=%q\nSIZE=%q\n' "$DIR" "$MP" "$SIZE" > "$STATE/$id"
+  mount --bind "$DIR" "$SH" || { umount "$MP"; rmdir "$MP"; die "shadow bind failed, nothing changed"; }
+  mount --bind "$MP" "$DIR" || { umount "$SH"; umount "$MP"; rmdir "$MP"; die "bind failed, nothing changed"; }
+  printf 'DIR=%q\nMP=%q\nSIZE=%q\nSH=%q\n' "$DIR" "$MP" "$SIZE" "$SH" > "$STATE/$id"
   echo "2ram: $DIR -> $MP ($SIZE), bound"
 }
 
@@ -68,7 +78,7 @@ do_unload(){
   is_bound || die "$DIR not currently bound to $MP (use: 2ram restore $DIR)"
   sync
   umount "$DIR" || die "$DIR busy, still bound, nothing changed"
-  if ! rsync -a --delete -- "$MP"/ "$DIR"/; then
+  if ! rs --delete -- "$MP"/ "$DIR"/; then
     mount --bind "$MP" "$DIR"
     die "copy back failed, re-bound ram copy, no data lost"
   fi
@@ -76,6 +86,7 @@ do_unload(){
     mount --bind "$MP" "$DIR"
     die "verify failed, re-bound ram copy, no data lost"
   fi
+  [ -n "${SH:-}" ] && mountpoint -q "$SH" && umount "$SH"
   umount "$MP" || die "data saved to $DIR, but could not unmount $MP"
   rmdir "$MP" 2>/dev/null
   rm -f "$STATE/$(mkid "$DIR")"
@@ -86,12 +97,22 @@ do_restore(){
   if is_bound; then
     umount "$DIR" || die "$DIR busy, nothing changed"
   fi
+  [ -n "${SH:-}" ] && mountpoint -q "$SH" && umount "$SH"
   if mountpoint -q "$MP"; then
     umount "$MP" || die "could not unmount $MP"
   fi
   rmdir "$MP" 2>/dev/null
   rm -f "$STATE/$(mkid "$DIR")"
   echo "2ram: $DIR restored to original mounts"
+}
+
+do_sync(){
+  command -v rsync >/dev/null 2>&1 || die "rsync required for sync"
+  is_bound || die "$DIR not currently bound to $MP"
+  [ -n "${SH:-}" ] && mountpoint -q "$SH" || die "no shadow mount for $DIR, unload and reload it"
+  sync
+  rs --delete -- "$MP"/ "$SH"/ || die "sync failed for $DIR"
+  echo "2ram: $DIR synced to disk"
 }
 
 do_list(){
@@ -106,7 +127,7 @@ do_list(){
 case "${1:-}" in
   ""|-h|--help) usage;;
   list) do_list;;
-  unload|restore)
+  unload|restore|sync)
     cmd=$1; shift
     [ -n "${1:-}" ] || usage
     if [ "$1" = "all" ]; then
