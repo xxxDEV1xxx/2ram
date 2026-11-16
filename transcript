@@ -1,0 +1,804 @@
+i need to drop in a new tool i made called 2ram. its used like so. 2ram /data/folder1 , or 2ram /data/folder1 4M , or 2ram /data/folder1 2G , where the folder is the folder to be sent to ram, and the size is the size of that folder. default will be 4MB ramdisk. we will be using rdmount /rd 4M etc etc for this function. where 2ram will invoke it to complete our function . then we will bindmount our new ramdisk, over the existing location were copying it from. there must be a 2ram unload , and a 2ram restore function. unload for when its currently running, to restore mounts and copy data from ram into the mount location safely, and restorem to restore mounts to original form before any changes were made.
+
+Assumption: rdmount <mountpoint> <size> mounts a ramdisk at that mountpoint. Each folder gets its own ramdisk at /rd/<path with / replaced by _>.
+
+This is a new file, so there is nothing to insert into. Replace the whole file from cat > /usr/local/bin/2ram through the final chmod line:
+
+bash
+cat > /usr/local/bin/2ram << 'EOF'
+#!/bin/bash
+set -u
+RDROOT=/rd
+STATE=/var/lib/2ram
+DEFSIZE=4M
+
+die(){ echo "2ram: $*" >&2; exit 1; }
+usage(){
+  echo "usage: 2ram DIR [SIZE]   load DIR into ramdisk (default $DEFSIZE), bind over DIR"
+  echo "       2ram unload DIR|all   copy ram data back into DIR, then drop mounts"
+  echo "       2ram restore DIR|all  drop mounts, DIR returns to its pre-2ram state (ram changes discarded)"
+  echo "       2ram list"
+  exit 1
+}
+
+[ "$(id -u)" -eq 0 ] || die "run as root"
+command -v rdmount >/dev/null 2>&1 || die "rdmount not found"
+
+tobytes(){
+  local s=${1^^} n u
+  s=${s%B}
+  n=${s%[KMG]}
+  u=${s#"$n"}
+  [[ $n =~ ^[0-9]+$ ]] || return 1
+  case $u in
+    "") echo "$n";;
+    K)  echo $((n*1024));;
+    M)  echo $((n*1048576));;
+    G)  echo $((n*1073741824));;
+    *)  return 1;;
+  esac
+}
+
+mkid(){ echo "$1" | tr '/' '_' | sed 's/^_//'; }
+
+is_bound(){
+  mountpoint -q "$MP" && mountpoint -q "$DIR" || return 1
+  [ "$(stat -c %d "$DIR")" = "$(stat -c %d "$MP")" ]
+}
+
+do_load(){
+  local dir size need used id
+  [ -n "${1:-}" ] || usage
+  dir=$(realpath -e -- "$1") || die "no such path: $1"
+  size=${2:-$DEFSIZE}
+  [ -d "$dir" ] || die "not a directory: $dir"
+  [ "$dir" != "/" ] || die "refusing /"
+  id=$(mkid "$dir")
+  [ ! -e "$STATE/$id" ] || die "already loaded: $dir"
+  need=$(tobytes "$size") || die "bad size: $size"
+  used=$(du -sb -- "$dir" | cut -f1)
+  [ "$used" -le "$need" ] || die "data is ${used}B, exceeds $size"
+  mkdir -p "$STATE" "$RDROOT/$id" || die "mkdir failed"
+  DIR=$dir; MP=$RDROOT/$id; SIZE=$size
+  rdmount "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+  mountpoint -q "$MP" || { rmdir "$MP" 2>/dev/null; die "$MP not mounted by rdmount"; }
+  cp -a -- "$DIR"/. "$MP"/ || { umount "$MP"; rmdir "$MP"; die "copy to ram failed, nothing changed"; }
+  diff -rq -- "$DIR" "$MP" >/dev/null 2>&1 || { umount "$MP"; rmdir "$MP"; die "verify failed, nothing changed"; }
+  mount --bind "$MP" "$DIR" || { umount "$MP"; rmdir "$MP"; die "bind failed, nothing changed"; }
+  printf 'DIR=%q\nMP=%q\nSIZE=%q\n' "$DIR" "$MP" "$SIZE" > "$STATE/$id"
+  echo "2ram: $DIR -> $MP ($SIZE), bound"
+}
+
+do_unload(){
+  command -v rsync >/dev/null 2>&1 || die "rsync required for unload"
+  is_bound || die "$DIR not currently bound to $MP (use: 2ram restore $DIR)"
+  sync
+  umount "$DIR" || die "$DIR busy, still bound, nothing changed"
+  if ! rsync -a --delete -- "$MP"/ "$DIR"/; then
+    mount --bind "$MP" "$DIR"
+    die "copy back failed, re-bound ram copy, no data lost"
+  fi
+  if [ -n "$(rsync -anc --delete --itemize-changes -- "$MP"/ "$DIR"/)" ]; then
+    mount --bind "$MP" "$DIR"
+    die "verify failed, re-bound ram copy, no data lost"
+  fi
+  umount "$MP" || die "data saved to $DIR, but could not unmount $MP"
+  rmdir "$MP" 2>/dev/null
+  rm -f "$STATE/$(mkid "$DIR")"
+  echo "2ram: $DIR unloaded, ram data written back"
+}
+
+do_restore(){
+  if is_bound; then
+    umount "$DIR" || die "$DIR busy, nothing changed"
+  fi
+  if mountpoint -q "$MP"; then
+    umount "$MP" || die "could not unmount $MP"
+  fi
+  rmdir "$MP" 2>/dev/null
+  rm -f "$STATE/$(mkid "$DIR")"
+  echo "2ram: $DIR restored to original mounts"
+}
+
+do_list(){
+  local f
+  for f in "$STATE"/*; do
+    [ -e "$f" ] || continue
+    . "$f"
+    if is_bound; then echo "$DIR  $MP  $SIZE  bound"; else echo "$DIR  $MP  $SIZE  NOT-BOUND"; fi
+  done
+}
+
+case "${1:-}" in
+  ""|-h|--help) usage;;
+  list) do_list;;
+  unload|restore)
+    cmd=$1; shift
+    [ -n "${1:-}" ] || usage
+    if [ "$1" = "all" ]; then
+      for f in "$STATE"/*; do
+        [ -e "$f" ] || continue
+        . "$f"
+        "do_$cmd"
+      done
+    else
+      d=$(realpath -m -- "$1")
+      f="$STATE/$(mkid "$d")"
+      [ -e "$f" ] || die "not managed by 2ram: $d"
+      . "$f"
+      "do_$cmd"
+    fi;;
+  *) do_load "$@";;
+esac
+EOF
+chmod 755 /usr/local/bin/2ram
+
+Usage:
+
+2ram /data/folder1
+2ram /data/folder1 4M
+2ram /data/folder1 2G
+2ram unload /data/folder1
+2ram restore /data/folder1
+2ram list
+Load: the ramdisk is mounted, the folder is copied in and verified with diff -rq, and only then is the bind mount placed over the folder. Any failure before the bind leaves everything unchanged. The original data stays untouched underneath the bind.
+unload: the bind is unmounted, then rsync -a --delete copies ram to the real folder and a checksum dry-run verifies it. On any failure it re-binds the ram copy, so nothing is lost. It needs rsync.
+restore: the bind and ramdisk are unmounted and the folder returns to its pre-2ram state. Changes made in ram are discarded.
+Mount check: restore and unload only unmount DIR when its device matches the 2ram ramdisk. This means a pre-existing mount on the folder is never unmounted by mistake.
+Open files: processes holding files open in the folder keep using the old files until they reopen them.
+
+Answer: /usr/local/bin/2ram created, executable, with load, unload, restore, and list.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2# 2ram list
+2ram: rdmount not found
+root@flex:/data/sda4/PS2#
+
+list shouldn’t need rdmount, and the script can’t see it on root’s PATH. Find where it lives first:
+
+type rdmount; ls -l /usr/local/bin/rdmount /usr/local/sbin/rdmount /usr/bin/rdmount /sbin/rdmount 2>&1 | grep -v 'No such'; find / -xdev -name 'rdmount*' -type f 2>/dev/null | head
+
+Replace this line in /usr/local/bin/2ram (line 9):
+
+command -v rdmount >/dev/null 2>&1 || die "rdmount not found"
+
+with:
+
+RDMOUNT=${RDMOUNT:-$(command -v rdmount 2>/dev/null)}
+
+In do_load, replace this line:
+
+  rdmount "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+
+with these two lines:
+
+  [ -n "$RDMOUNT" ] && [ -x "$RDMOUNT" ] || { rmdir "$MP" 2>/dev/null; die "rdmount not found (set RDMOUNT=/full/path)"; }
+  "$RDMOUNT" "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+
+The find output tells you what to do next:
+
+A real file at some path: run RDMOUNT=/that/path 2ram .... To make it permanent, change line 9 to RDMOUNT=${RDMOUNT:-/that/path}.
+type says “function” or “alias”: a script can’t see it. Paste its definition (type rdmount output) and I’ll inline it into 2ram.
+No file found: rdmount isn’t installed on this host. Paste its source or tell me what it does, and I’ll write the equivalent.
+
+Answer: line 9 now only resolves RDMOUNT, list no longer fails, and the rdmount call in do_load is replaced by the two lines above.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+we actually want to link this to the main read only folder on /usr 
+root@flex:/data/sda4/PS2# chmod 755 /data/sda4/usr/local/bin/2ram so it runs. we use a overlay style and bindmount style or symbolic link style
+
+Check what already sits on /usr/local/bin first, so you don’t stack a second mount over it:
+
+findmnt -T /usr/local/bin; ls -ld /data/sda4/usr/local/bin; ls -l /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram 2>&1
+
+1. Create the file at the new path. If /usr/local/bin/2ram was never written because /usr is read-only, rerun the earlier heredoc with only these two lines changed. The script body stays as is.
+
+Line 1 of the paste, replace:
+
+cat > /usr/local/bin/2ram << 'EOF'
+
+with:
+
+mkdir -p /data/sda4/usr/local/bin && cat > /data/sda4/usr/local/bin/2ram << 'EOF'
+
+Last line of the paste, replace:
+
+chmod 755 /usr/local/bin/2ram
+
+with:
+
+chmod 755 /data/sda4/usr/local/bin/2ram
+
+2. Link it into /usr/local/bin. Pick one.
+
+Overlay (keeps the existing /usr/local/bin contents and adds 2ram). Use this unless findmnt showed an overlay already mounted there:
+
+mkdir -p /data/sda4/.ovl_work_usrlocalbin
+mount -t overlay overlay -o lowerdir=/usr/local/bin,upperdir=/data/sda4/usr/local/bin,workdir=/data/sda4/.ovl_work_usrlocalbin /usr/local/bin
+
+The workdir must be empty, on the same filesystem as the upperdir, and outside it. If findmnt already shows an overlay on /usr/local/bin whose upperdir is /data/sda4/usr/local/bin, skip this step because 2ram is already visible.
+
+Bind mount (hides the existing /usr/local/bin contents, shows only your dir):
+
+mount --bind /data/sda4/usr/local/bin /usr/local/bin
+
+Symlink (needs /usr writable):
+
+mount -o remount,rw /usr && ln -sf /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram; mount -o remount,ro /usr
+
+If /usr is not its own mount, replace the remount commands with the remount of whichever mount findmnt -T /usr reports.
+
+No /usr changes at all:
+
+echo 'export PATH=/data/sda4/usr/local/bin:$PATH' >> /root/.bashrc && export PATH=/data/sda4/usr/local/bin:$PATH
+
+3. Verify:
+
+type 2ram && 2ram list
+
+The rdmount fix from before still applies. If rdmount isn’t on root’s PATH, run RDMOUNT=/full/path 2ram ....
+
+One caution: 2ram’s own bind mount on a folder under /usr also needs that mount to be writable. Don’t run 2ram load on /usr/local/bin itself, because it would bind over the overlay that holds the script.
+
+Answer: save to /data/sda4/usr/local/bin/2ram, chmod 755 it, then overlay-mount /data/sda4/usr/local/bin onto /usr/local/bin.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2# chmod 755 /usr/local/bin/2ram
+root@flex:/data/sda4/PS2# chmod 755 /data/sda4/usr/local/bin/2ram
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# findmnt -T /usr/local/bin; ls -ld /data/sda4/usr/local/bin; ls -l /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram 2>&1
+TARGET     SOURCE  FSTYPE  OPTIONS
+/usr/local overlay overlay rw,relatime,lowerdir=/usr/local,upperdir=/run/tmpfs_overlay_AlXG6U/upper,workdir=/run/tmpfs_overlay_AlXG6U/work
+drwxr-xr-x 2 root root 4096 Nov 16 18:21 /data/sda4/usr/local/bin
+-rwxr-xr-x 1 root root 3780 Nov 16 18:22 /data/sda4/usr/local/bin/2ram
+-rwxr-xr-x 1 root root 3780 Nov 16 18:19 /usr/local/bin/2ram
+root@flex:/data/sda4/PS2#
+
+/usr/local is already a writable overlay, so 2ram is already visible at /usr/local/bin/2ram. Do not run the overlay or bind step from before, because it would stack a second mount on /usr/local/bin. The problem is that its upperdir is /run/tmpfs_overlay_AlXG6U/upper, which is RAM. The /usr/local/bin/2ram copy you chmod’d is lost on reboot. The persistent copy is /data/sda4/usr/local/bin/2ram.
+
+1. Confirm the two copies are identical and the rdmount fix is in the persistent one:
+
+cmp /usr/local/bin/2ram /data/sda4/usr/local/bin/2ram && echo SAME; grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+If cmp reports a difference, the persistent copy is the one to keep. The symlink in step 2 replaces the other.
+If grep prints nothing, the RDMOUNT patch from my earlier reply is not applied. Apply it to /data/sda4/usr/local/bin/2ram, not to the tmpfs copy.
+
+2. Replace the tmpfs copy with a symlink to the persistent file (the overlay is rw, so no remount is needed):
+
+ln -sf /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram
+
+3. Recreate the symlink at boot. Add this exact line to whichever boot script on flex builds the /run/tmpfs_overlay_* mounts, after the overlay mount line. I don’t know which script that is:
+
+ln -sf /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram
+
+If you tell me the script path, I’ll give the exact line to insert after.
+
+4. Verify:
+
+ls -l /usr/local/bin/2ram; type 2ram; 2ram list
+
+2ram list should print nothing and exit 0. If rdmount is still not on root’s PATH, 2ram load will stop with the “set RDMOUNT=/full/path” error, and the find command from two replies ago will show where it lives.
+
+Answer: skip the overlay/bind step; run ln -sf /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram now and add the same line to the boot script.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+its writing to tmpfs overlay. itll disappear. we need my /data/sda4/usr like i said
+
+Right: the overlay’s upperdir is RAM, so the persistent upper has to be /data/sda4/usr/local. Skip the ln -sf from my last reply. Overlay upperdirs can’t be changed by remount, so mount a second overlay on top of the existing one. Its lowerdir is the current merged /usr/local, and its upperdir is your persistent dir, so all new writes land on /data/sda4.
+
+1. Mount (new lines, run once):
+
+mkdir -p /data/sda4/.ovl_work_usrlocal /data/sda4/usr/local/bin
+mount -t overlay overlay -o lowerdir=/usr/local,upperdir=/data/sda4/usr/local,workdir=/data/sda4/.ovl_work_usrlocal /usr/local
+
+The persistent 2ram is already at /data/sda4/usr/local/bin/2ram, so it appears through the new overlay at /usr/local/bin/2ram.
+
+2. Verify the writes land on disk:
+
+findmnt -T /usr/local
+touch /usr/local/.persist_test; ls -l /data/sda4/usr/local/.persist_test; rm /usr/local/.persist_test
+type 2ram; 2ram list
+
+findmnt should show upperdir=/data/sda4/usr/local, and the ls should find the test file. If mount errors, run dmesg | tail -5 and paste the output.
+
+3. Boot persistence: the tmpfs overlay is rebuilt every boot, so add these exact lines after the line in your boot script that mounts /run/tmpfs_overlay_*:
+
+mkdir -p /data/sda4/.ovl_work_usrlocal
+mount -t overlay overlay -o lowerdir=/usr/local,upperdir=/data/sda4/usr/local,workdir=/data/sda4/.ovl_work_usrlocal /usr/local
+
+I don’t know which script that is. Give me its path and I’ll give the exact line to insert after. /data/sda4 must be mounted before these lines run.
+
+To undo: umount /usr/local removes only the top overlay.
+
+Answer: mount an overlay with upperdir=/data/sda4/usr/local over /usr/local, then add the same mount lines to the boot script.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+no, it needs to be specific for this tool. just link it like i do with my apt xt
+
+# 3. Symlink the required executable into /usr/bin
+ln -sfn /data/lib-ext/usr/bin/fuser /usr/bin/fuser
+
+Understood: no overlay, just a symlink like your fuser line. Undo the overlay I had you mount, if you ran it:
+
+umount /usr/local
+
+Skip that line if findmnt -T /usr/local still shows upperdir=/run/tmpfs_overlay_....
+
+Your /usr/bin pattern for this tool, with the persistent file already at /data/sda4/usr/local/bin/2ram:
+
+ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+
+If you want it under /usr/local/bin instead, use this line:
+
+ln -sfn /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram
+
+The /usr/local/bin line replaces the tmpfs copy at that path. The /usr/bin line adds a new link. Pick one.
+
+Add that same line to the boot script block where your other ln -sfn lines live, right after the fuser line:
+
+ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+
+Verify:
+
+ls -l /usr/bin/2ram; type 2ram; 2ram list
+
+ls -l should show -> /data/sda4/usr/local/bin/2ram. If ln fails with “Read-only file system” on /usr/bin, give me the exact error and I’ll give the remount line to run before the ln and after it.
+
+The RDMOUNT patch from earlier still applies to /data/sda4/usr/local/bin/2ram. If rdmount isn’t on root’s PATH, 2ram load stops with “set RDMOUNT=/full/path”. To check:
+
+grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+
+Answer: ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram, plus that same line after the fuser line in your boot script.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram
+root@flex:/data/sda4/PS2#
+
+Both links are in place. Verify them, and check that the RDMOUNT patch is in the persistent file:
+
+ls -l /usr/bin/2ram /usr/local/bin/2ram; type 2ram; 2ram list; grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+
+Expected:
+
+Both ls -l lines show -> /data/sda4/usr/local/bin/2ram.
+2ram list prints nothing and exits 0.
+grep prints lines. If it prints nothing, the RDMOUNT patch is missing from the persistent file. Say so and I’ll give the exact replace lines for it.
+
+Both links are the same tool, so the /usr/local/bin link is redundant. To keep only the /usr/bin one, which matches your fuser pattern:
+
+rm /usr/local/bin/2ram
+
+Boot persistence: add this exact line to your boot script right after the fuser line:
+
+ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+
+If you keep the /usr/local/bin link too, add this line directly under it:
+
+ln -sfn /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram
+
+Answer: links created; run the verify line, then add the ln -sfn ... /usr/bin/2ram line after fuser in the boot script.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram
+root@flex:/data/sda4/PS2# rm /usr/local/bin/2ram
+root@flex:/data/sda4/PS2# nano /data/sh/1a.sh
+root@flex:/data/sda4/PS2# 2ram --help
+-bash: /usr/local/bin/2ram: No such file or directory
+root@flex:/data/sda4/PS2#
+
+Bash cached the old path /usr/local/bin/2ram before you removed that link. The /usr/bin link is fine. Clear the hash table:
+
+hash -r; type 2ram; ls -l /usr/bin/2ram; 2ram list
+
+type 2ram should now say /usr/bin/2ram. 2ram list should print nothing.
+
+For the boot script you just opened, add this exact line right after the fuser line in /data/sh/1a.sh:
+
+ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+
+Also run this to check that the RDMOUNT patch is in the persistent file:
+
+grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+
+If it prints nothing, tell me and I’ll give the exact replace lines.
+
+Answer: run hash -r, then 2ram list.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/2ram /usr/local/bin/2ram
+root@flex:/data/sda4/PS2# rm /usr/local/bin/2ram
+root@flex:/data/sda4/PS2# nano /data/sh/1a.sh
+root@flex:/data/sda4/PS2# 2ram --help
+-bash: /usr/local/bin/2ram: No such file or directory
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# hash -r; type 2ram; ls -l /usr/bin/2ram; 2ram list
+2ram is /usr/bin/2ram
+lrwxrwxrwx 1 root root 29 Nov 16 18:26 /usr/bin/2ram -> /data/sda4/usr/local/bin/2ram
+2ram: rdmount not found
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+root@flex:/data/sda4/PS2# grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+root@flex:/data/sda4/PS2# 2ram --help
+2ram: rdmount not found
+root@flex:/data/sda4/PS2#
+
+2ram itself works now. grep printed nothing, so the RDMOUNT patch was never applied to the persistent file. Both lines below are still the originals.
+
+Locate them:
+
+grep -n 'rdmount' /data/sda4/usr/local/bin/2ram
+
+Replace 1. Replace this line:
+
+command -v rdmount >/dev/null 2>&1 || die "rdmount not found"
+
+with:
+
+RDMOUNT=${RDMOUNT:-$(command -v rdmount 2>/dev/null)}
+
+Replace 2. In do_load, replace this line:
+
+  rdmount "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+
+with these two lines:
+
+  [ -n "$RDMOUNT" ] && [ -x "$RDMOUNT" ] || { rmdir "$MP" 2>/dev/null; die "rdmount not found (set RDMOUNT=/full/path)"; }
+  "$RDMOUNT" "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+
+Then find where rdmount actually lives. It is not on root’s PATH:
+
+type rdmount; find / -xdev -name 'rdmount*' 2>/dev/null | head; grep -rn 'rdmount' /data/sh /root/.bashrc /etc/profile 2>/dev/null | head
+File found: set the permanent path in the script. Change your new line to RDMOUNT=${RDMOUNT:-/that/path}, or symlink it with ln -sfn /that/path /usr/bin/rdmount.
+Function or alias: a script cannot call it. Paste the output and I’ll inline it into 2ram.
+Nothing found: paste what rdmount /rd 4M does on your system, or its source, and I’ll write the equivalent into 2ram.
+
+Verify after the edits:
+
+2ram --help; 2ram list
+
+--help should print the usage text. list should print nothing.
+
+Answer: apply the two replaces, then run the find/grep line to locate rdmount.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+give py atch script that does that
+
+Paste this whole block into the shell. It backs up the file, applies both replacements by exact line match, and aborts without changes if either line isn’t found exactly once. It does nothing if already patched.
+
+python3 - << 'EOF'
+import os, shutil
+p = '/data/sda4/usr/local/bin/2ram'
+s = open(p).read()
+if 'RDMOUNT=' in s:
+    raise SystemExit('already patched, no change')
+old1 = 'command -v rdmount >/dev/null 2>&1 || die "rdmount not found"\n'
+new1 = 'RDMOUNT=${RDMOUNT:-$(command -v rdmount 2>/dev/null)}\n'
+old2 = '  rdmount "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }\n'
+new2 = ('  [ -n "$RDMOUNT" ] && [ -x "$RDMOUNT" ] || { rmdir "$MP" 2>/dev/null; die "rdmount not found (set RDMOUNT=/full/path)"; }\n'
+        '  "$RDMOUNT" "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }\n')
+if s.count(old1) != 1 or s.count(old2) != 1:
+    raise SystemExit('abort: expected lines not found exactly once, no change (old1=%d old2=%d)' % (s.count(old1), s.count(old2)))
+shutil.copy2(p, p + '.bak')
+open(p, 'w').write(s.replace(old1, new1).replace(old2, new2))
+os.chmod(p, 0o755)
+print('patched, backup at ' + p + '.bak')
+EOF
+bash -n /data/sda4/usr/local/bin/2ram && echo SYNTAX_OK; grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+
+Expected: patched, backup at ..., then SYNTAX_OK, then 3 grep lines (the assignment, the check, and the call).
+
+If it prints abort: ... old1=0 or old2=0, run grep -n 'rdmount' /data/sda4/usr/local/bin/2ram and paste the output. If the script works but 2ram list still ends in “rdmount not found”, it only means rdmount is not on root’s PATH; run the type rdmount; find ... line from my last reply to locate it.
+
+Answer: paste the block above; it patches /data/sda4/usr/local/bin/2ram in place with a .bak backup.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+EOF
+
+in/2ram && echo SYNTAX_OK; grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2rampatched, backup at /data/sda4/usr/local/bin/2ram.bak
+root@flex:/data/sda4/PS2# bash -n /data/sda4/usr/local/bin/2ram && echo SYNTAX_OK; grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+SYNTAX_OK
+17:RDMOUNT=${RDMOUNT:-$(command -v rdmount 2>/dev/null)}
+55:  [ -n "$RDMOUNT" ] && [ -x "$RDMOUNT" ] || { rmdir "$MP" 2>/dev/null; die "rdmount not found (set RDMOUNT=/full/path)"; }
+56:  "$RDMOUNT" "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+root@flex:/data/sda4/PS2#
+
+Patched and syntax-clean. Now check the two commands that decide whether 2ram can run:
+
+2ram --help; 2ram list; echo "rc=$?"
+type rdmount; find / -xdev -name 'rdmount*' 2>/dev/null | head; grep -rn 'rdmount' /data/sh /root/.bashrc /etc/profile 2>/dev/null | head
+
+Expected:
+
+--help prints the usage text, exit 1 (the script’s usage exits 1).
+list prints nothing, rc=0.
+The find/grep output shows where rdmount lives.
+
+Then act on the rdmount result:
+
+A file path: make it permanent with ln -sfn /that/path /usr/bin/rdmount, and add that same line after the 2ram line in /data/sh/1a.sh.
+type says function or alias: paste its definition and I’ll inline it into 2ram.
+Nothing found: paste what rdmount /rd 4M does on your system and I’ll write the equivalent into 2ram.
+
+Once rdmount resolves, test on a throwaway folder first:
+
+mkdir -p /data/sda4/PS2/t2r && echo hi > /data/sda4/PS2/t2r/a
+2ram /data/sda4/PS2/t2r
+cat /data/sda4/PS2/t2r/a; 2ram list
+2ram unload /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a
+
+findmnt after unload should print nothing, and cat should print hi.
+
+Answer: run the first check line, then link rdmount once located.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+in/2ram && echo SYNTAX_OK; grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2rampatched, backup at /data/sda4/usr/local/bin/2ram.bak
+root@flex:/data/sda4/PS2# bash -n /data/sda4/usr/local/bin/2ram && echo SYNTAX_OK; grep -n 'RDMOUNT' /data/sda4/usr/local/bin/2ram
+SYNTAX_OK
+17:RDMOUNT=${RDMOUNT:-$(command -v rdmount 2>/dev/null)}
+55:  [ -n "$RDMOUNT" ] && [ -x "$RDMOUNT" ] || { rmdir "$MP" 2>/dev/null; die "rdmount not found (set RDMOUNT=/full/path)"; }
+56:  "$RDMOUNT" "$MP" "$size" || { rmdir "$MP" 2>/dev/null; die "rdmount failed"; }
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# 2ram --help; 2ram list; echo "rc=$?"
+ind / -xdev -name 'rdmount*' 2>/dev/null | head; grep -rn 'rdmount' /data/sh /root/.bashrc /etc/profile 2>/dusage: 2ram DIR [SIZE]   load DIR into ramdisk (default 4M), bind over DIR
+       2ram unload DIR|all   copy ram data back into DIR, then drop mounts
+       2ram restore DIR|all  drop mounts, DIR returns to its pre-2ram state (ram changes discarded)
+       2ram list
+rc=0
+root@flex:/data/sda4/PS2# type rdmount; find / -xdev -name 'rdmount*' 2>/dev/null | head; grep -rn 'rdmount' /data/sh /root/.bashrc /etc/profile 2>/dev/null | head
+-bash: type: rdmount: not found
+root@flex:/data/sda4/PS2#
+
+Searching for the mount, excluding other filesystems.
+
+2ram runs correctly. rdmount is not on PATH, and the find could not see it: -xdev stops at filesystem boundaries, so it never searched /data. The grep of /data/sh, /root/.bashrc and /etc/profile also found no rdmount. Search all mounts:
+
+find / \( -path /proc -o -path /sys \) -prune -o \( -name 'rdmount*' -o -name 'rdmount' \) -print 2>/dev/null | head
+grep -rIl 'rdmount' /data/sh /data/sda4 /data/lib-ext /etc /root 2>/dev/null | head
+
+Then act on the result:
+
+A file path: run ln -sfn /that/path /usr/bin/rdmount, then add that same line after the 2ram line in /data/sh/1a.sh.
+Only a script that mentions rdmount (a function inside a file): paste that function and I’ll inline it into 2ram.
+Nothing at all: rdmount does not exist on flex yet. Here is a minimal one to drop in, which makes rdmount <mountpoint> <size> mount a tmpfs:
+cat > /data/sda4/usr/local/bin/rdmount << 'EOF'
+#!/bin/bash
+[ $# -ge 1 ] || { echo "usage: rdmount MOUNTPOINT [SIZE]" >&2; exit 1; }
+mkdir -p -- "$1" && mount -t tmpfs -o size="${2:-4M}",mode=755 tmpfs "$1"
+EOF
+chmod 755 /data/sda4/usr/local/bin/rdmount
+ln -sfn /data/sda4/usr/local/bin/rdmount /usr/bin/rdmount
+
+Boot line, after the 2ram line in /data/sh/1a.sh:
+
+ln -sfn /data/sda4/usr/local/bin/rdmount /usr/bin/rdmount
+
+Only use the minimal script if the search finds nothing. If your real rdmount exists, use that.
+
+Answer: run the two search lines; link rdmount if found, otherwise create the minimal tmpfs one.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# find / \( -path /proc -o -path /sys \) -prune -o \( -name 'rdmount*' -o -name 'rdmount' \) -print 2>/dev/null | head
+sda4 /data/lib-ext /etc /root 2>/dev/null | head
+root@flex:/data/sda4/PS2# grep -rIl 'rdmount' /data/sh /data/sda4 /data/lib-ext /etc /root 2>/dev/null | head
+^@^@
+^C
+root@flex:/data/sda4/PS2#
+
+The find printed nothing, so there is no rdmount file anywhere outside /proc and /sys. The grep hung because /data/sda4 is too large to scan, and you interrupted it. Run a narrower search with a time limit:
+
+timeout 20 grep -rIl 'rdmount' /data/sh /root /etc 2>/dev/null | head; alias | grep rdmount; declare -F | grep rdmount
+A file is listed: run grep -n 'rdmount' <that file> and paste the output. I’ll inline the definition into 2ram.
+Nothing is listed: rdmount does not exist on flex. Create it with this block, which makes rdmount <mountpoint> [size] mount a tmpfs (default 4M):
+cat > /data/sda4/usr/local/bin/rdmount << 'EOF'
+#!/bin/bash
+[ $# -ge 1 ] || { echo "usage: rdmount MOUNTPOINT [SIZE]" >&2; exit 1; }
+mkdir -p -- "$1" && mount -t tmpfs -o size="${2:-4M}",mode=755 tmpfs "$1"
+EOF
+chmod 755 /data/sda4/usr/local/bin/rdmount
+ln -sfn /data/sda4/usr/local/bin/rdmount /usr/bin/rdmount
+
+Add this exact line to /data/sh/1a.sh directly after your 2ram line:
+
+ln -sfn /data/sda4/usr/local/bin/rdmount /usr/bin/rdmount
+
+Then test on a throwaway folder:
+
+mkdir -p /data/sda4/PS2/t2r && echo hi > /data/sda4/PS2/t2r/a
+2ram /data/sda4/PS2/t2r
+cat /data/sda4/PS2/t2r/a; 2ram list
+2ram unload /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a
+
+Expected: cat prints hi both times, list shows the folder as bound, and findmnt after unload prints nothing.
+
+Answer: run the narrow search line; if it finds nothing, create rdmount with the block above and run the test.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# cat > /data/sda4/usr/local/bin/rdmount << 'EOF'
+
+#!/bin/bash
+[ $# -ge 1 ] || { echo "usage: rdmount MOUNTPOINT [SIZE]" >&2; exit 1; }
+mkdir -p -- "$1" && mount -t tmpfs -o size="${2:-4M}",mode=755 tmpfs "$1"
+EOF
+
+root@flex:/data/sda4/PS2# chmod 755 /data/sda4/usr/local/bin/rdmount
+root@flex:/data/sda4/PS2# ln -sfn /data/sda4/usr/local/bin/rdmount /usr/bin/rdmount
+root@flex:/data/sda4/PS2# mkdir -p /data/sda4/PS2/t2r && echo hi > /data/sda4/PS2/t2r/a
+S2/t2r/a; 2ram list
+2ram unload /data/sda4/PS2/t2r
+findmnt /droot@flex:/data/sda4/PS2# 2ram /data/sda4/PS2/t2r
+ata/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/amkdir: cannot create directory ‘/rd’: Read-only file system
+2ram: mkdir failed
+root@flex:/data/sda4/PS2# cat /data/sda4/PS2/t2r/a; 2ram list
+hi
+root@flex:/data/sda4/PS2# 2ram unload /data/sda4/PS2/t2r
+2ram: not managed by 2ram: /data/sda4/PS2/t2r
+root@flex:/data/sda4/PS2# findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a
+hi
+root@flex:/data/sda4/PS2#
+
+The root filesystem is read-only, so 2ram could not create /rd. It stopped before touching anything: t2r still holds hi and nothing is mounted. The not managed by 2ram message from unload is correct, because nothing was loaded.
+
+Replace this line (line 3 of /data/sda4/usr/local/bin/2ram):
+
+RDROOT=/rd
+
+with:
+
+RDROOT=${RDROOT:-/run/2ram}
+
+/run is tmpfs on flex, so mkdir works and nothing under it survives reboot, which suits ramdisk mountpoints. As a patch script:
+
+python3 - << 'EOF'
+p = '/data/sda4/usr/local/bin/2ram'
+s = open(p).read()
+old = 'RDROOT=/rd\n'
+if s.count(old) != 1:
+    raise SystemExit('abort: RDROOT=/rd line not found exactly once, no change')
+open(p, 'w').write(s.replace(old, 'RDROOT=${RDROOT:-/run/2ram}\n'))
+print('patched')
+EOF
+bash -n /data/sda4/usr/local/bin/2ram && echo SYNTAX_OK; touch /run/.w && rm /run/.w && echo RUN_WRITABLE
+
+Expected: patched, SYNTAX_OK, RUN_WRITABLE. If RUN_WRITABLE doesn’t print, run findmnt -T /run and paste it.
+
+If you want the mountpoints under /rd specifically, create /rd once on a writable path and use RDROOT=/rd 2ram .... For example, remount / rw, mkdir /rd, and remount / ro. Tell me the findmnt -T / output and I’ll give the exact remount lines.
+
+Re-run the test:
+
+2ram /data/sda4/PS2/t2r
+cat /data/sda4/PS2/t2r/a; 2ram list; findmnt /data/sda4/PS2/t2r
+echo new > /data/sda4/PS2/t2r/b
+2ram unload /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a /data/sda4/PS2/t2r/b
+
+Expected: hi printed, list shows bound, and findmnt shows a tmpfs. After unload, findmnt prints nothing and cat prints hi then new.
+
+Answer: replace RDROOT=/rd with RDROOT=${RDROOT:-/run/2ram} (run the patch block), then re-run the test.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2# 2ram /data/sda4/PS2/t2r
+am list; findmnt /data/sda4/PS2/t2r
+echo new > /data/sda4/PS2/t2r/b
+2ram unload /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a /data/sda4/P2ram: /data/sda4/PS2/t2r -> /run/2ram/data_sda4_PS2_t2r (4M), bound
+root@flex:/data/sda4/PS2# cat /data/sda4/PS2/t2r/a; 2ram list; findmnt /data/sda4/PS2/t2r
+hi
+S2/t2r/b/data/sda4/PS2/t2r  /run/2ram/data_sda4_PS2_t2r  4M  bound
+TARGET             SOURCE FSTYPE OPTIONS
+/data/sda4/PS2/t2r tmpfs  tmpfs  rw,relatime,size=4096k,mode=755,inode64
+root@flex:/data/sda4/PS2# echo new > /data/sda4/PS2/t2r/b
+root@flex:/data/sda4/PS2# 2ram unload /data/sda4/PS2/t2r
+2ram: /data/sda4/PS2/t2r unloaded, ram data written back
+root@flex:/data/sda4/PS2# findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a /data/sda4/PS2/t2r/b
+hi
+new
+root@flex:/data/sda4/PS2#
+
+load and unload both pass. The folder bound as tmpfs, b was written in RAM, and unload copied it back to disk with the mount dropped.
+
+Test restore next. It should discard RAM changes:
+
+2ram /data/sda4/PS2/t2r
+echo ramonly > /data/sda4/PS2/t2r/c
+2ram restore /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r; ls /data/sda4/PS2/t2r; 2ram list
+
+Expected: findmnt prints nothing, ls shows only a and b (no c), and list prints nothing.
+
+Then clean up the test folder:
+
+rm -rf /data/sda4/PS2/t2r
+
+Boot persistence: both links must exist in /data/sh/1a.sh. Check:
+
+grep -n '2ram\|rdmount' /data/sh/1a.sh
+
+If a line is missing, add it right after your fuser line:
+
+ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+ln -sfn /data/sda4/usr/local/bin/rdmount /usr/bin/rdmount
+
+/run/2ram is recreated automatically on each load, so no boot line is needed for it. After a reboot, any loaded folder shows its on-disk contents again, since the bind and tmpfs are gone. Run 2ram unload before reboot to keep RAM changes.
+
+Answer: run the restore test, delete t2r, and confirm both ln -sfn lines are in /data/sh/1a.sh.
+
+To run code, enable code execution and file creation in Settings → Capabilities.
+
+root@flex:/data/sda4/PS2# 2ram /data/sda4/PS2/t2r
+am list; findmnt /data/sda4/PS2/t2r
+echo new > /data/sda4/PS2/t2r/b
+2ram unload /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a /data/sda4/P2ram: /data/sda4/PS2/t2r -> /run/2ram/data_sda4_PS2_t2r (4M), bound
+root@flex:/data/sda4/PS2# cat /data/sda4/PS2/t2r/a; 2ram list; findmnt /data/sda4/PS2/t2r
+hi
+S2/t2r/b/data/sda4/PS2/t2r  /run/2ram/data_sda4_PS2_t2r  4M  bound
+TARGET             SOURCE FSTYPE OPTIONS
+/data/sda4/PS2/t2r tmpfs  tmpfs  rw,relatime,size=4096k,mode=755,inode64
+root@flex:/data/sda4/PS2# echo new > /data/sda4/PS2/t2r/b
+root@flex:/data/sda4/PS2# 2ram unload /data/sda4/PS2/t2r
+2ram: /data/sda4/PS2/t2r unloaded, ram data written back
+root@flex:/data/sda4/PS2# findmnt /data/sda4/PS2/t2r; cat /data/sda4/PS2/t2r/a /data/sda4/PS2/t2r/b
+hi
+new
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2#
+root@flex:/data/sda4/PS2# 2ram /data/sda4/PS2/t2r
+2/t2r/c
+2ram restore /data/sda4/PS2/t2r
+findmnt /data/sda4/PS2/t2r; ls /data/sda4/PS2/t2r; 2ram list2ram: /data/sda4/PS2/t2r -> /run/2ram/data_sda4_PS2_t2r (4M), bound
+root@flex:/data/sda4/PS2# echo ramonly > /data/sda4/PS2/t2r/c
+root@flex:/data/sda4/PS2# 2ram restore /data/sda4/PS2/t2r
+2ram: /data/sda4/PS2/t2r restored to original mounts
+root@flex:/data/sda4/PS2# findmnt /data/sda4/PS2/t2r; ls /data/sda4/PS2/t2r; 2ram list
+a  b
+root@flex:/data/sda4/PS2# rm -rf /data/sda4/PS2/t2r
+root@flex:/data/sda4/PS2# grep -n '2ram\|rdmount' /data/sh/1a.sh
+925:ln -sfn /data/sda4/usr/local/bin/2ram /usr/bin/2ram
+926:cat > /data/sda4/usr/local/bin/rdmount << 'EOF'
+928:[ $# -ge 1 ] || { echo "usage: rdmount MOUNTPOINT [SIZE]" >&2; exit 1; }
+931:chmod 755 /data/sda4/usr/local/bin/rdmount
+932:ln -sfn /data/sda4/usr/local/bin/rdmount /usr/bin/rdmount
+root@flex:/data/sda4/PS2#
+
+All three paths pass:
+
+load: bound as tmpfs.
+unload: RAM data (b) was written back to disk.
+restore: the mount was dropped and the RAM-only c was discarded, leaving a b.
+
+Your /data/sh/1a.sh already has both links, so nothing needs to be added:
+
+Line 925 links 2ram into /usr/bin.
+Lines 926-932 recreate rdmount and link it into /usr/bin on every boot.
+
+Operational notes:
+
+To process every loaded folder at once, run 2ram unload all or 2ram restore all.
+unload needs rsync installed. Check with command -v rsync.
+To use another mount root, run RDROOT=/other/path 2ram DIR.
+
+Answer: 2ram is complete and boot-persistent; nothing further to patch.
