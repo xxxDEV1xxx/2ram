@@ -6,3 +6,14 @@ ls /run/2ram/.orig/data_sda4_PS2_t2r
 echo lost > /data/sda4/PS2/t2r/c
 2ram restore /data/sda4/PS2/t2r
 findmnt /data/sda4/PS2/t2r /run/2ram/.orig/data_sda4_PS2_t2r; ls /data/sda4/PS2/t2r; rm -rf /data/sda4/PS2/t2r
+
+
+#Expected: the first ls shows a b. After restore, findmnt prints nothing and ls shows a b. That means b survived because it was synced, and c is gone because it never was.
+
+#To sync automatically, add this cron line, with an interval of your choice:
+#*/10 * * * * /usr/bin/2ram sync all >/dev/null 2>&1
+#The new behavior:
+#Lock: a second 2ram run at the same time prints another 2ram is running. The cron sync simply retries next interval.
+#Headroom: load now refuses data over 80% of the size. Use a bigger size, or run FORCE=1 2ram DIR SIZE to override.
+#Copy: rsync -aHAX keeps hardlinks, ACLs and xattrs. If the destination rejects ACLs or xattrs, it falls back to -aH automatically.
+#Requirement: load now needs rsync, same as unload.
